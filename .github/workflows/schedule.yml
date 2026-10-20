@@ -1,0 +1,38 @@
+name: Refresh schedule
+
+# Weekly (Sunday 9:13 AM ET-ish) plus manual. Pulls Clemson's season schedule
+# (2 CFBD calls), commits schedule.json, and posts a "Next game" card.
+on:
+  schedule:
+    - cron: "13 13 * * 0"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: schedule-refresh
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt
+      - run: python live_score_bot.py schedule
+        env:
+          CFBD_API_KEY: ${{ secrets.CFBD_API_KEY }}
+          WIKI_API_URL: ${{ secrets.WIKI_API_URL }}
+          WIKI_BOT_USER: ${{ secrets.WIKI_BOT_USER }}
+          WIKI_BOT_PASSWORD: ${{ secrets.WIKI_BOT_PASSWORD }}
+      - name: Commit schedule
+        run: |
+          git config user.name "LiveScoreBot"
+          git config user.email "actions@users.noreply.github.com"
+          git add schedule.json
+          if ! git diff --cached --quiet; then
+            git commit -m "Update schedule" && git push
+          fi
