@@ -1,29 +1,26 @@
 #!/usr/bin/env python3
 """
-Tiger Tales live-score bot.
+Tiger Tales live-score bot — every Clemson varsity sport.
 
-Pulls Clemson football scores from the CollegeFootballData.com (CFBD) API and
-writes them to a data page on the Tiger Tales wiki, which the Main Page shows
-through {{Live Score}}.
+Data: the public schedule/results feed behind clemsontigers.com (one feed for
+all 18 programs, plus a live-states feed during games). Football games also
+get down-and-distance / possession from CollegeFootballData.com when a
+CFBD_API_KEY is set.
+
+Writes two wiki pages:
+  Template:Live Score/Data   the Main Page card: live game > recent final > next game
+  Template:Live Ticker/Data  the scrolling bar at the top of every page
 
 Subcommands
-  schedule   Fetch this season's Clemson schedule (2 API calls) into schedule.json,
-             and post a "Next game" box if nothing is in progress. Run weekly.
-  run        If a Clemson game is near kickoff or in progress, poll the scoreboard
-             and update the wiki until the game is final. Otherwise exit at once,
-             spending zero API calls. Run hourly.
-  render     Print the wikitext for a sample/fixture game (testing, no network).
+  update   Hourly. Refresh both pages. If a game is live or starts within the
+           hour, keep polling every POLL_SECONDS until nothing is live.
+  render   Print both pages for a fixture file (testing, no network).
 
-Environment variables
-  CFBD_API_KEY        CollegeFootballData.com API key (free tier is fine)
-  WIKI_API_URL        e.g. https://tigertalesclemson.com/w/api.php
-  WIKI_BOT_USER       BotPassword login name, e.g. Parkerfoodman@livescore
-  WIKI_BOT_PASSWORD   BotPassword secret
-  WIKI_DATA_PAGE      page the bot writes (default: Template:Live Score/Data)
-  WIKI_PURGE_PAGES    pages to purge after each edit, "|"-separated (default: Main Page)
-  TEAM                default: Clemson
-  POLL_SECONDS        seconds between scoreboard calls (default: 120)
-  DRY_RUN=1           print what would be written instead of editing the wiki
+Environment
+  WIKI_API_URL, WIKI_BOT_USER, WIKI_BOT_PASSWORD   wiki login (BotPassword)
+  CFBD_API_KEY       optional, adds football situation/possession
+  POLL_SECONDS       default 120
+  DRY_RUN=1          print instead of editing the wiki
 """
 
 from __future__ import annotations
@@ -31,6 +28,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 import time
 from datetime import datetime, timedelta, timezone
@@ -39,21 +37,36 @@ from zoneinfo import ZoneInfo
 
 import requests
 
+SITE = "https://clemsontigers.com"
+FEED = SITE + "/website-api/schedule-events"
+LIVE_FEED = FEED + "/live-states"
 CFBD_BASE = "https://apinext.collegefootballdata.com"
 EASTERN = ZoneInfo("America/New_York")
-HERE = Path(__file__).resolve().parent
-SCHEDULE_FILE = HERE / "schedule.json"
 
-TEAM = os.environ.get("TEAM", "Clemson")
+CARD_PAGE = os.environ.get("WIKI_CARD_PAGE", "Template:Live Score/Data")
+TICKER_PAGE = os.environ.get("WIKI_TICKER_PAGE", "Template:Live Ticker/Data")
 POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "120"))
-DATA_PAGE = os.environ.get("WIKI_DATA_PAGE", "Template:Live Score/Data")
 DRY_RUN = os.environ.get("DRY_RUN") == "1"
 
-# Start polling this long before kickoff, give up this long after.
-PRE_KICK = timedelta(minutes=10)
-MAX_GAME = timedelta(hours=5, minutes=30)
-# GitHub Actions jobs die at 6h; stop a bit before that.
+FINAL_ON_CARD = timedelta(hours=4)      # keep a final on the card this long
+FINALS_ON_TICKER = timedelta(days=5)    # recent results shown in the ticker
+UPCOMING_ON_TICKER = timedelta(days=7)
+LOOKAHEAD = timedelta(minutes=70)       # stay running if a game starts this soon
 JOB_BUDGET = timedelta(hours=5, minutes=45)
+
+# When several games are live at once, the card shows the highest priority.
+PRIORITY = ["Football", "Men's Basketball", "Women's Basketball", "Baseball",
+            "Softball", "Volleyball", "Men's Soccer", "Women's Soccer", "Lacrosse",
+            "Gymnastics"]
+SHORT = {"Men's Basketball": "MBB", "Women's Basketball": "WBB", "Men's Soccer": "MSOC",
+         "Women's Soccer": "WSOC", "Men's Tennis": "MTEN", "Women's Tennis": "WTEN",
+         "Men's Golf": "MGOLF", "Women's Golf": "WGOLF", "Cross Country": "XC",
+         "Track & Field": "T&F", "Football": "FB", "Baseball": "BASE", "Softball": "SB",
+         "Volleyball": "VB", "Lacrosse": "LAX", "Gymnastics": "GYM", "Rowing": "ROW"}
+
+# Sports where events are meets/tournaments rather than one opponent.
+INDIVIDUAL = {"Men's Golf", "Women's Golf", "Men's Tennis", "Women's Tennis", "Cross Country",
+              "Track & Field", "Rowing"}
 
 USER_AGENT = "TigerTalesLiveScoreBot/1.0 (https://tigertalesclemson.com; User:Parkerfoodman)"
 
@@ -62,48 +75,292 @@ def log(msg: str) -> None:
     print(f"[{datetime.now(timezone.utc):%H:%M:%S}Z] {msg}", flush=True)
 
 
-# --------------------------------------------------------------------------- CFBD
+def now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def parse_time(s: str) -> datetime:
+    return datetime.fromisoformat(s.replace("Z", "+00:00"))
+
+
+# --------------------------------------------------------------------------- data
+
+class Athletics:
+    """clemsontigers.com schedule feed (all sports)."""
+
+    def __init__(self):
+        self.s = requests.Session()
+        self.s.headers.update({"User-Agent": USER_AGENT, "Accept": "application/json"})
+
+    def _events(self, **filters) -> list[dict]:
+        params = {"include": "schedule.sport,scheduleEventResult",
+                  "filter[hide_from_schedule_ticker]": "false", "per_page": "40"}
+        params.update(filters)
+        r = self.s.get(FEED, params=params, timeout=30)
+        r.raise_for_status()
+        return r.json().get("data", [])
+
+    def recent(self) -> list[dict]:
+        return self._events(**{"filter[past]": "true", "sort": "-datetime"})
+
+    def upcoming(self) -> list[dict]:
+        return self._events(**{"filter[upcoming]": "true", "sort": "datetime"})
+
+    def live_states(self) -> dict:
+        r = self.s.get(LIVE_FEED, timeout=30)
+        r.raise_for_status()
+        out = {}
+        for item in r.json().get("data", []) or []:
+            eid = item.get("schedule_event_id") or item.get("id")
+            if eid is not None:
+                out[int(eid)] = item
+        return out
+
 
 class CFBD:
     def __init__(self, key: str):
-        if not key:
-            sys.exit("CFBD_API_KEY is not set")
+        self.key = key
         self.s = requests.Session()
-        self.s.headers.update({"Authorization": f"Bearer {key}",
-                               "Accept": "application/json",
-                               "User-Agent": USER_AGENT})
-        self.calls = 0
+        self.s.headers.update({"Authorization": f"Bearer {key}", "User-Agent": USER_AGENT})
 
-    def get(self, path: str, **params):
-        self.calls += 1
-        r = self.s.get(CFBD_BASE + path, params=params, timeout=30)
-        if r.status_code == 429:
-            raise RuntimeError("CFBD monthly/rate limit hit (429)")
-        r.raise_for_status()
-        return r.json()
-
-    def season_games(self, year: int, team: str) -> list[dict]:
-        games = []
-        for season_type in ("regular", "postseason"):
-            games += self.get("/games", year=year, team=team, seasonType=season_type)
-        return games
-
-    def scoreboard(self) -> list[dict]:
-        return self.get("/scoreboard", classification="fbs")
+    def clemson_live(self) -> dict | None:
+        if not self.key:
+            return None
+        try:
+            r = self.s.get(CFBD_BASE + "/scoreboard", params={"classification": "fbs"}, timeout=30)
+            r.raise_for_status()
+        except Exception as e:
+            log(f"CFBD error (ignored): {e}")
+            return None
+        for g in r.json():
+            names = {(g.get("homeTeam") or {}).get("name"), (g.get("awayTeam") or {}).get("name")}
+            if "Clemson" in names:
+                return g
+        return None
 
 
-def pick(d: dict, *keys, default=None):
-    """First present key — tolerates camelCase (v2) and snake_case (v1) fields."""
-    for k in keys:
-        if isinstance(d, dict) and d.get(k) not in (None, ""):
-            return d[k]
-    return default
+# --------------------------------------------------------------------------- model
+
+def num(v) -> str:
+    if v in (None, ""):
+        return ""
+    try:
+        f = float(v)
+        return str(int(f)) if f == int(f) else f"{f:g}"
+    except (TypeError, ValueError):
+        return str(v)
 
 
-def team_name(side) -> str:
-    if isinstance(side, dict):
-        return pick(side, "name", "school", "team", default="")
-    return side or ""
+def sport_of(e: dict) -> str:
+    return ((e.get("schedule") or {}).get("sport") or {}).get("name") or "Clemson"
+
+
+def opp_of(e: dict) -> str:
+    return e.get("opponent_name") or (e.get("opponent") or {}).get("name") or "TBA"
+
+
+def is_live(e: dict, live: dict) -> bool:
+    st = live.get(int(e["id"]))
+    if not st:
+        return False
+    state = str(st.get("statbroadcast_state") or st.get("state") or st.get("status") or "").lower()
+    if st.get("not_yet_live") is True or state in ("not_yet_live", "pre", "pregame", "scheduled"):
+        return False
+    if state in ("final", "completed", "post", "postgame", "ended"):
+        return False
+    return True
+
+
+def normalize(e: dict, live: dict) -> dict:
+    """Flatten one feed event into what the card/ticker need."""
+    res = e.get("schedule_event_result") or {}
+    st = live.get(int(e["id"])) or {}
+    g = {
+        "id": e["id"],
+        "sport": sport_of(e),
+        "opp": opp_of(e),
+        "ha": e.get("venue_type") or "home",
+        "start": parse_time(e["datetime"]),
+        "tba": e.get("tba"),
+        "location": (e.get("location") or "").replace(" | ", " · "),
+        "rank": e.get("ranking") or "",
+        "opp_rank": e.get("opponent_ranking") or "",
+        "status": "upcoming",
+        "us": "", "them": "", "result": "", "text": "", "period": "", "clock": "",
+    }
+    if is_live(e, live):
+        g.update(status="live", us=num(st.get("our_score")), them=num(st.get("opponent_score")),
+                 period=st.get("period_label") or "", clock=st.get("status_label") or "")
+    elif e.get("status") == "completed" or res.get("result"):
+        r = res.get("result")
+        w, l = num(res.get("winning_score")), num(res.get("losing_score"))
+        if r == "win":
+            g.update(status="final", us=w, them=l, result="W")
+        elif r == "loss":
+            g.update(status="final", us=l, them=w, result="L")
+        elif r == "tie":
+            g.update(status="final", us=w, them=l, result="T")
+        else:
+            txt = tidy_text(res.get("text"))
+            if txt:
+                g.update(status="final", text=txt)
+            else:
+                g["status"] = "done"  # completed, nothing meaningful to show
+    if e.get("status") in ("cancelled", "canceled", "postponed"):
+        g.update(status="off", text=e.get("status").title())
+    return g
+
+
+def tidy_text(t) -> str:
+    """'5TH of 14' -> '5th of 14'; drop placeholders like '--' or 'COMPLETED'."""
+    t = re.sub(r"\s+", " ", (t or "").replace(" | ", "; ")).strip()
+    if t.lower() in ("", "--", "-", "completed", "final", "tba"):
+        return ""
+    t = re.sub(r"(\d)(ST|ND|RD|TH)\b", lambda m: m.group(1) + m.group(2).lower(), t)
+    return re.sub(r"\bOF\b", "of", t)
+
+
+def per_sport(games: list[dict], n: int) -> list[dict]:
+    seen: dict[str, int] = {}
+    out = []
+    for g in games:
+        seen[g["sport"]] = seen.get(g["sport"], 0) + 1
+        if seen[g["sport"]] <= n:
+            out.append(g)
+    return out
+
+
+def vs_at(g: dict) -> str:
+    return "at" if g["ha"] == "away" else "vs"
+
+
+def matchup(g: dict) -> str:
+    """'vs SMU', 'at Virginia', or just the meet name for golf/tennis/XC."""
+    return g["opp"] if g["sport"] in INDIVIDUAL else f"{vs_at(g)} {g['opp']}"
+
+
+def when(g: dict) -> str:
+    dt = g["start"].astimezone(EASTERN)
+    day = f"{dt:%a}, {dt:%b} {dt.day}"
+    if g["tba"] in ("date_tba",):
+        return "Date TBA"
+    if g["tba"] or g["start"].astimezone(EASTERN).strftime("%H:%M") in ("00:00", "00:01"):
+        return day
+    hour = dt.strftime("%I").lstrip("0")
+    return f"{day} · {hour}:{dt:%M %p} ET"
+
+
+# --------------------------------------------------------------------------- wikitext
+
+def clean(v) -> str:
+    return str(v).replace("|", "{{!}}").replace("\n", " ").replace("}}", "} }").strip()
+
+
+def stamp() -> str:
+    return datetime.now(EASTERN).strftime("%b %d, %I:%M %p ET").replace(" 0", " ")
+
+
+def card_text(g: dict | None, football: dict | None = None) -> str:
+    head = "<!-- Written automatically by the live-score bot. Manual edits will be overwritten. -->\n"
+    if not g:
+        return head + "{{Live Score/Box|status=none|updated=%s}}\n" % stamp()
+    home_is_us = g["ha"] != "away"
+    us_name = "Clemson" + (f" ({g['rank']})" if g["rank"] else "")
+    them_name = g["opp"] + (f" ({g['opp_rank']})" if g["opp_rank"] else "")
+    f = {
+        "status": "final" if g["status"] in ("final", "off") else g["status"],
+        "sport": g["sport"],
+        "game_id": g["id"],
+        "home": us_name if home_is_us else them_name,
+        "away": them_name if home_is_us else us_name,
+        "home_score": (g["us"] if home_is_us else g["them"]) if g["status"] in ("live", "final") else "",
+        "away_score": (g["them"] if home_is_us else g["us"]) if g["status"] in ("live", "final") else "",
+        "result": g["result"],
+        "note": g["text"],
+        "period": g["period"],
+        "clock": g["clock"],
+        "venue": g["location"],
+        "kickoff": when(g),
+        "updated": stamp(),
+    }
+    if football and g["sport"] == "Football" and g["status"] == "live":
+        poss = football.get("possession")
+        teams = {"home": (football.get("homeTeam") or {}).get("name"),
+                 "away": (football.get("awayTeam") or {}).get("name")}
+        if poss in teams and teams[poss]:
+            f["possession"] = f["home"] if (teams[poss] == "Clemson") == home_is_us else f["away"]
+        f["situation"] = football.get("situation") or ""
+        f["tv"] = football.get("tv") or ""
+        if football.get("clock"):
+            f["clock"] = football["clock"]
+        if football.get("period"):
+            p = int(football["period"])
+            f["period"] = {1: "1st", 2: "2nd", 3: "3rd", 4: "4th"}.get(p, "OT")
+    lines = [head + "{{Live Score/Box"]
+    for k, v in f.items():
+        if v not in (None, ""):
+            lines.append(f"|{k}={clean(v)}")
+    lines.append("}}")
+    return "\n".join(lines) + "\n"
+
+
+def ticker_item(g: dict) -> str:
+    sport = SHORT.get(g["sport"], g["sport"])
+    if g["status"] == "live":
+        detail = " ".join(x for x in (g["period"], g["clock"]) if x)
+        return (f"{{{{Live Ticker/Item|state=live|sport={clean(sport)}"
+                f"|text=Clemson {g['us'] or 0}, {clean(g['opp'])} {g['them'] or 0}|detail={clean(detail)}}}}}")
+    if g["status"] in ("final", "off"):
+        if g["text"]:
+            text = f"{clean(g['opp'])}: {clean(g['text'])}"
+            res = ""
+        else:
+            text = f"{g['result'] + ' ' if g['result'] else ''}{g['us']}–{g['them']} {clean(matchup(g))}"
+            res = g["result"]
+        return f"{{{{Live Ticker/Item|state=final|sport={clean(sport)}|text={text}|result={res}}}}}"
+    return (f"{{{{Live Ticker/Item|state=upcoming|sport={clean(sport)}"
+            f"|text={clean(matchup(g))}|detail={clean(when(g))}}}}}")
+
+
+def ticker_text(live: list, finals: list, upcoming: list) -> str:
+    items = [ticker_item(g) for g in live + finals + upcoming]
+    head = "<!-- Written automatically by the live-score bot. Manual edits will be overwritten. -->\n"
+    if not items:
+        return head + "<!-- no items -->\n"
+    return head + "\n".join(items) + "\n<!-- updated %s -->\n" % stamp()
+
+
+def pick(games: list[dict], now: datetime):
+    """Split into live / recent finals / upcoming, and choose the card game."""
+    live = [g for g in games if g["status"] == "live"]
+    finals = sorted([g for g in games if g["status"] in ("final", "off")
+                     and now - g["start"] <= FINALS_ON_TICKER], key=lambda g: g["start"], reverse=True)
+    upcoming = sorted([g for g in games if g["status"] == "upcoming" and g["start"] > now - timedelta(hours=6)
+                       and g["start"] - now <= UPCOMING_ON_TICKER and g["tba"] != "date_tba"],
+                      key=lambda g: g["start"])
+    rank = lambda g: PRIORITY.index(g["sport"]) if g["sport"] in PRIORITY else len(PRIORITY)
+    live.sort(key=rank)
+    if live:
+        card = live[0]
+    else:
+        recent = [g for g in finals if not g["text"] and now - g["start"] <= FINAL_ON_CARD + timedelta(hours=3)]
+        future = [g for g in upcoming if g["start"] > now - timedelta(minutes=15)]
+        card = recent[0] if recent else (future[0] if future else (finals[0] if finals else None))
+    return card, live, per_sport(finals, 2)[:12], per_sport(upcoming, 2)[:10]
+
+
+def needs_polling(games: list[dict], now: datetime) -> bool:
+    if any(g["status"] == "live" for g in games):
+        return True
+    for g in games:
+        if g["status"] == "upcoming" and not g["tba"]:
+            start = g["start"]
+            local = start.astimezone(EASTERN).strftime("%H:%M")
+            if local in ("00:00", "00:01"):
+                continue  # all-day / multi-day events (golf, tennis, XC)
+            if now - timedelta(hours=4) <= start <= now + LOOKAHEAD:
+                return True
+    return False
 
 
 # --------------------------------------------------------------------------- wiki
@@ -116,16 +373,10 @@ class Wiki:
         self.user, self.password = user, password
         self.logged_in = False
 
-    def _get(self, **p):
+    def _req(self, method, **p):
         p.update(format="json", formatversion="2")
-        r = self.s.get(self.api, params=p, timeout=30)
-        if r.status_code >= 400:
-            raise RuntimeError(f"Wiki HTTP {r.status_code}: {r.text[:600]!r}")
-        return r.json()
-
-    def _post(self, **p):
-        p.update(format="json", formatversion="2")
-        r = self.s.post(self.api, data=p, timeout=30)
+        r = (self.s.get(self.api, params=p, timeout=30) if method == "GET"
+             else self.s.post(self.api, data=p, timeout=30))
         if r.status_code >= 400:
             raise RuntimeError(f"Wiki HTTP {r.status_code}: {r.text[:600]!r}")
         return r.json()
@@ -133,35 +384,29 @@ class Wiki:
     def login(self):
         if self.logged_in:
             return
-        tok = self._get(action="query", meta="tokens", type="login")["query"]["tokens"]["logintoken"]
-        res = self._post(action="login", lgname=self.user, lgpassword=self.password, lgtoken=tok)
+        tok = self._req("GET", action="query", meta="tokens", type="login")["query"]["tokens"]["logintoken"]
+        res = self._req("POST", action="login", lgname=self.user, lgpassword=self.password, lgtoken=tok)
         if res.get("login", {}).get("result") != "Success":
-            raise RuntimeError(f"Wiki login failed: {res}")
+            raise RuntimeError(f"Wiki login failed: {res.get('login')}")
         self.logged_in = True
 
     def read(self, title: str) -> str:
-        data = self._get(action="query", prop="revisions", titles=title,
-                         rvprop="content", rvslots="main")
-        page = data["query"]["pages"][0]
-        if page.get("missing"):
-            return ""
-        return page["revisions"][0]["slots"]["main"]["content"]
+        page = self._req("GET", action="query", prop="revisions", titles=title,
+                         rvprop="content", rvslots="main")["query"]["pages"][0]
+        return "" if page.get("missing") else page["revisions"][0]["slots"]["main"]["content"]
 
     def write(self, title: str, text: str, summary: str):
         self.login()
-        csrf = self._get(action="query", meta="tokens")["query"]["tokens"]["csrftoken"]
-        res = self._post(action="edit", title=title, text=text, summary=summary,
-                         bot="1", token=csrf)
+        csrf = self._req("GET", action="query", meta="tokens")["query"]["tokens"]["csrftoken"]
+        res = self._req("POST", action="edit", title=title, text=text, summary=summary, bot="1", token=csrf)
         if res.get("edit", {}).get("result") != "Success":
             raise RuntimeError(f"Wiki edit failed: {res}")
-        # Main Page is cached; purge so the new score shows up right away.
-        purge = os.environ.get("WIKI_PURGE_PAGES", "Main Page")
-        if purge:
-            try:
-                self._post(action="purge", titles=purge, forcelinkupdate="1")
-            except Exception as e:
-                log(f"Purge failed (non-fatal): {e}")
-        return res["edit"]
+
+    def purge(self, titles: str):
+        try:
+            self._req("POST", action="purge", titles=titles, forcelinkupdate="1")
+        except Exception as e:
+            log(f"Purge failed (non-fatal): {e}")
 
 
 def make_wiki() -> Wiki | None:
@@ -173,220 +418,108 @@ def make_wiki() -> Wiki | None:
     return Wiki(url, user, pw)
 
 
-def publish(wiki: Wiki | None, text: str, summary: str, current: str | None = None):
-    """Edit only when the box actually changed (ignoring the 'updated' stamp)."""
-    def strip(t):
-        return "\n".join(l for l in (t or "").splitlines() if not l.startswith("|updated="))
-    if current is not None and strip(current) == strip(text):
-        log("No change — skipping edit")
-        return
-    if wiki is None:
-        log("DRY RUN — would write:\n" + text)
-        return
-    wiki.write(DATA_PAGE, text, summary)
-    log(f"Wrote {DATA_PAGE}: {summary}")
+def comparable(t: str) -> str:
+    """Ignore the timestamp lines when deciding whether an edit is needed."""
+    return "\n".join(l for l in (t or "").splitlines()
+                     if not l.startswith("|updated=") and not l.startswith("<!-- updated"))
 
 
-# --------------------------------------------------------------------------- rendering
+class Publisher:
+    def __init__(self, wiki: Wiki | None):
+        self.wiki = wiki
+        self.last: dict[str, str] = {}
 
-def fmt_kickoff(start_iso: str) -> str:
-    dt = parse_time(start_iso).astimezone(EASTERN)
-    hour = dt.strftime("%I").lstrip("0")
-    return f"{dt:%a, %b} {dt.day} · {hour}:{dt:%M %p} ET"
-
-
-def parse_time(s: str) -> datetime:
-    return datetime.fromisoformat(s.replace("Z", "+00:00"))
-
-
-def period_label(period) -> str:
-    try:
-        p = int(period)
-    except (TypeError, ValueError):
-        return ""
-    return {1: "1st", 2: "2nd", 3: "3rd", 4: "4th"}.get(p, "OT" if p == 5 else f"{p - 4}OT")
-
-
-def box(**fields) -> str:
-    fields["updated"] = datetime.now(EASTERN).strftime("%b %d, %I:%M %p ET").replace(" 0", " ")
-    order = ["status", "game_id", "home", "away", "home_score", "away_score", "result",
-             "period", "clock", "possession", "situation", "last_play", "tv", "venue",
-             "kickoff", "updated"]
-    lines = ["<!-- Written automatically by LiveScoreBot. Manual edits will be overwritten on gameday. -->",
-             "{{Live Score/Box"]
-    for k in order:
-        v = fields.get(k)
-        if v not in (None, ""):
-            v = str(v).replace("|", "{{!}}").replace("\n", " ")
-            lines.append(f"|{k}={v}")
-    lines.append("}}")
-    return "\n".join(lines)
-
-
-def box_upcoming(g: dict) -> str:
-    return box(status="upcoming", game_id=g["id"], home=g["home"], away=g["away"],
-               venue=g.get("venue"), tv=g.get("tv"), kickoff=fmt_kickoff(g["start"]))
-
-
-def box_from_scoreboard(sb: dict, g: dict) -> str:
-    home, away = sb.get("homeTeam", {}), sb.get("awayTeam", {})
-    status = (sb.get("status") or "").lower()
-    hs, as_ = pick(home, "points", default=0), pick(away, "points", default=0)
-    state = {"in_progress": "live", "completed": "final"}.get(status, "upcoming")
-    result = ""
-    if state == "final":
-        ours, theirs = (hs, as_) if team_name(home) == TEAM else (as_, hs)
-        result = "W" if (ours or 0) > (theirs or 0) else "L" if (ours or 0) < (theirs or 0) else "T"
-    poss = sb.get("possession")
-    poss_team = team_name(home) if poss == "home" else team_name(away) if poss == "away" else ""
-    venue = sb.get("venue") or {}
-    venue_str = venue.get("name") if isinstance(venue, dict) else venue
-    last_play = sb.get("lastPlay") or ""
-    if len(last_play) > 160:
-        last_play = last_play[:157] + "…"
-    return box(status=state, game_id=pick(sb, "id", default=g["id"]),
-               home=team_name(home) or g["home"], away=team_name(away) or g["away"],
-               home_score=hs if state != "upcoming" else "",
-               away_score=as_ if state != "upcoming" else "",
-               result=result,
-               period=period_label(sb.get("period")) if state == "live" else "",
-               clock=sb.get("clock") if state == "live" else "",
-               possession=poss_team if state == "live" else "",
-               situation=sb.get("situation") if state == "live" else "",
-               last_play=last_play if state == "live" else "",
-               tv=sb.get("tv") or g.get("tv"),
-               venue=venue_str or g.get("venue"),
-               kickoff=fmt_kickoff(g["start"]))
-
-
-# --------------------------------------------------------------------------- schedule
-
-def normalize_game(raw: dict) -> dict | None:
-    start = pick(raw, "startDate", "start_date")
-    if not start:
-        return None
-    return {
-        "id": pick(raw, "id"),
-        "start": start,
-        "home": pick(raw, "homeTeam", "home_team"),
-        "away": pick(raw, "awayTeam", "away_team"),
-        "venue": pick(raw, "venue"),
-        "completed": bool(pick(raw, "completed", default=False)),
-    }
-
-
-def load_schedule() -> list[dict]:
-    if not SCHEDULE_FILE.exists():
-        return []
-    return json.loads(SCHEDULE_FILE.read_text())["games"]
-
-
-def find_active(games: list[dict], now: datetime) -> dict | None:
-    for g in sorted(games, key=lambda g: g["start"]):
-        start = parse_time(g["start"])
-        if start - PRE_KICK - timedelta(minutes=60) <= now <= start + MAX_GAME:
-            return g
-    return None
-
-
-def next_game(games: list[dict], now: datetime) -> dict | None:
-    future = [g for g in games if parse_time(g["start"]) > now]
-    return min(future, key=lambda g: g["start"]) if future else None
-
-
-def cmd_schedule(args):
-    cfbd = CFBD(os.environ.get("CFBD_API_KEY", ""))
-    now = datetime.now(timezone.utc)
-    year = args.year or (now.year if now.month >= 2 else now.year - 1)
-    games = [g for g in (normalize_game(r) for r in cfbd.season_games(year, TEAM)) if g]
-    games.sort(key=lambda g: g["start"])
-    SCHEDULE_FILE.write_text(json.dumps({"season": year, "team": TEAM,
-                                         "fetched": now.isoformat(), "games": games}, indent=2))
-    log(f"Saved {len(games)} games for {year} ({cfbd.calls} API calls)")
-
-    if find_active(games, now):
-        log("A game is in progress/near kickoff — leaving the live box alone")
-        return
-    ng = next_game(games, now)
-    if ng:
-        wiki = make_wiki()
-        current = wiki.read(DATA_PAGE) if wiki else None
-        if current and "|status=final" in current and parse_time(ng["start"]) - now > timedelta(days=6):
-            log("Keeping last final score up; next game is more than 6 days out")
-            return
-        publish(wiki, box_upcoming(ng), f"Next game: {ng['away']} at {ng['home']}", current)
-
-
-def cmd_run(args):
-    now = datetime.now(timezone.utc)
-    games = load_schedule()
-    g = find_active(games, now)
-    if not g:
-        log("No Clemson game in the live window — nothing to do (0 API calls)")
-        return
-
-    wiki = make_wiki()
-    current = wiki.read(DATA_PAGE) if wiki else None
-    if current and "|status=final" in current and f"|game_id={g['id']}" in current:
-        log("This game is already marked final on the wiki — done")
-        return
-
-    start = parse_time(g["start"])
-    deadline = min(start + MAX_GAME, now + JOB_BUDGET)
-
-    # Before kickoff: show the upcoming box and sleep without spending API calls.
-    publish(wiki, box_upcoming(g), f"Gameday: {g['away']} at {g['home']}", current)
-    wait = (start - PRE_KICK - datetime.now(timezone.utc)).total_seconds()
-    if wait > 0:
-        log(f"Kickoff {fmt_kickoff(g['start'])} — sleeping {int(wait // 60)} min")
-        time.sleep(wait)
-
-    cfbd = CFBD(os.environ.get("CFBD_API_KEY", ""))
-    last_text = None
-    misses = 0
-    while datetime.now(timezone.utc) < deadline:
-        try:
-            board = cfbd.scoreboard()
-        except Exception as e:  # network blip — keep going
-            log(f"Scoreboard error: {e}")
-            time.sleep(POLL_SECONDS)
-            continue
-        sb = next((x for x in board
-                   if TEAM in (team_name(x.get("homeTeam")), team_name(x.get("awayTeam")))), None)
-        if sb is None:
-            misses += 1
-            log(f"{TEAM} not on scoreboard yet (miss {misses})")
+    def put(self, title: str, text: str, summary: str) -> bool:
+        if title not in self.last and self.wiki:
+            self.last[title] = self.wiki.read(title)
+        if comparable(self.last.get(title)) == comparable(text):
+            return False
+        if self.wiki is None:
+            log(f"DRY RUN — {title}:\n{text}")
         else:
-            text = box_from_scoreboard(sb, g)
-            state = "final" if "|status=final" in text else "live" if "|status=live" in text else "pre"
-            try:
-                publish(wiki, text, f"Score update ({state})", last_text)
-                last_text = text
-            except Exception as e:
-                log(f"Wiki edit error: {e}")
-            if state == "final":
-                log(f"Final. Used {cfbd.calls} API calls this run.")
+            self.wiki.write(title, text, summary)
+            log(f"Wrote {title}: {summary}")
+        self.last[title] = text
+        return True
+
+
+# --------------------------------------------------------------------------- commands
+
+def gather(ath: Athletics) -> list[dict]:
+    live = {}
+    try:
+        live = ath.live_states()
+    except Exception as e:
+        log(f"live-states error (ignored): {e}")
+    seen, games = set(), []
+    for e in ath.recent() + ath.upcoming():
+        if e["id"] in seen:
+            continue
+        seen.add(e["id"])
+        games.append(normalize(e, live))
+    return games
+
+
+def summary_for(card: dict | None) -> str:
+    if not card:
+        return "No games scheduled"
+    label = {"live": "Live", "final": "Final", "off": "Final", "upcoming": "Next"}.get(card["status"], "")
+    return f"{label}: {card['sport']} {matchup(card)}"
+
+
+def cmd_update(args):
+    ath = Athletics()
+    cfbd = CFBD(os.environ.get("CFBD_API_KEY", ""))
+    pub = Publisher(make_wiki())
+    started = now_utc()
+    failures = 0
+    while True:
+        now = now_utc()
+        try:
+            games = gather(ath)
+            failures = 0
+        except Exception as e:
+            failures += 1
+            log(f"Athletics feed error ({failures}/3): {e}")
+            games = None
+            if failures >= 3:
+                log("Giving up for now; the next hourly run will try again.")
+                sys.exit(1)
+        if games is not None:
+            card, live, finals, upcoming = pick(games, now)
+            football = cfbd.clemson_live() if (card and card["sport"] == "Football"
+                                                and card["status"] == "live") else None
+            changed = pub.put(CARD_PAGE, card_text(card, football), summary_for(card))
+            changed |= pub.put(TICKER_PAGE, ticker_text(live, finals, upcoming),
+                               f"Ticker: {len(live)} live, {len(finals)} results, {len(upcoming)} upcoming")
+            if changed and pub.wiki:
+                pub.wiki.purge("Main Page")
+            if not needs_polling(games, now):
+                log(f"Nothing live or about to start — done. ({len(games)} events checked)")
                 return
+            log(f"{len(live)} live; polling again in {POLL_SECONDS}s")
+        if now_utc() - started > JOB_BUDGET:
+            log("Hit time budget; the next hourly run will continue.")
+            return
         time.sleep(POLL_SECONDS)
-    log(f"Hit time budget; used {cfbd.calls} API calls. Next hourly run will pick up if needed.")
 
 
 def cmd_render(args):
-    fixture = json.loads(Path(args.fixture).read_text())
-    g = fixture["schedule_game"]
-    print(box_upcoming(g))
-    print()
-    for sb in fixture["scoreboard_states"]:
-        print(box_from_scoreboard(sb, g))
-        print()
+    fx = json.loads(Path(args.fixture).read_text())
+    now = parse_time(fx["now"])
+    live = {int(k): v for k, v in fx.get("live_states", {}).items()}
+    games = [normalize(e, live) for e in fx["events"]]
+    card, l, f, u = pick(games, now)
+    print(card_text(card, fx.get("cfbd")))
+    print(ticker_text(l, f, u))
+    print("needs_polling:", needs_polling(games, now))
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
-    s = sub.add_parser("schedule"); s.add_argument("--year", type=int); s.set_defaults(fn=cmd_schedule)
-    r = sub.add_parser("run"); r.set_defaults(fn=cmd_run)
-    t = sub.add_parser("render"); t.add_argument("fixture"); t.set_defaults(fn=cmd_render)
+    sub.add_parser("update").set_defaults(fn=cmd_update)
+    r = sub.add_parser("render"); r.add_argument("fixture"); r.set_defaults(fn=cmd_render)
     args = ap.parse_args()
     args.fn(args)
 
