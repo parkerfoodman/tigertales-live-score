@@ -1,0 +1,31 @@
+name: Live score
+
+# Hourly check. If no Clemson game is within the gameday window, the job exits
+# in seconds and spends zero CFBD API calls. On gameday it sleeps until just
+# before kickoff, then polls the scoreboard until the game is final.
+on:
+  schedule:
+    - cron: "7 * * * *"
+  workflow_dispatch: {}
+
+concurrency:
+  group: live-score
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt
+      - run: python live_score_bot.py run
+        env:
+          CFBD_API_KEY: ${{ secrets.CFBD_API_KEY }}
+          WIKI_API_URL: ${{ secrets.WIKI_API_URL }}
+          WIKI_BOT_USER: ${{ secrets.WIKI_BOT_USER }}
+          WIKI_BOT_PASSWORD: ${{ secrets.WIKI_BOT_PASSWORD }}
+          POLL_SECONDS: "120"
