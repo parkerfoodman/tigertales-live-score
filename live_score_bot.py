@@ -10,6 +10,7 @@ CFBD_API_KEY is set.
 Writes two wiki pages:
   Template:Live Score/Data   the Main Page card: live game > recent final > next game
   Template:Live Ticker/Data  the scrolling bar at the top of every page
+  Template:Live Week/Data    every game in the next 7 days, under the Main Page card
 
 Subcommands
   update   Hourly. Refresh both pages. If a game is live or starts within the
@@ -45,6 +46,7 @@ EASTERN = ZoneInfo("America/New_York")
 
 CARD_PAGE = os.environ.get("WIKI_CARD_PAGE", "Template:Live Score/Data")
 TICKER_PAGE = os.environ.get("WIKI_TICKER_PAGE", "Template:Live Ticker/Data")
+WEEK_PAGE = os.environ.get("WIKI_WEEK_PAGE", "Template:Live Week/Data")
 POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "120"))
 DRY_RUN = os.environ.get("DRY_RUN") == "1"
 
@@ -330,6 +332,34 @@ def ticker_text(live: list, finals: list, upcoming: list) -> str:
     return head + "\n".join(items) + "\n<!-- updated %s -->\n" % stamp()
 
 
+def week_text(games: list[dict], now: datetime) -> str:
+    """Every game from now through the next 7 days, grouped by day (Eastern)."""
+    head = "<!-- Written automatically by the live-score bot. Manual edits will be overwritten. -->\n"
+    rows = sorted([g for g in games
+                   if (g["status"] == "live" or (g["status"] == "upcoming" and g["start"] >= now - timedelta(hours=3)))
+                   and g["start"] - now <= UPCOMING_ON_TICKER and g["tba"] != "date_tba"],
+                  key=lambda g: (g["start"], g["sport"]))
+    if not rows:
+        return head + "{{Live Week/Empty}}\n"
+    out, day = [head + "{{Live Week/Start}}"], None
+    for g in rows:
+        dt = g["start"].astimezone(EASTERN)
+        label = "Today" if dt.date() == now.astimezone(EASTERN).date() else f"{dt:%A}, {dt:%b} {dt.day}"
+        if label != day:
+            out.append(f"{{{{Live Week/Day|{label}}}}}")
+            day = label
+        if g["status"] == "live":
+            time_s = "LIVE"
+        elif g["tba"] or dt.strftime("%H:%M") in ("00:00", "00:01"):
+            time_s = "All day" if g["sport"] in INDIVIDUAL else "TBA"
+        else:
+            time_s = dt.strftime("%I:%M %p").lstrip("0")
+        out.append(f"{{{{Live Week/Row|sport={clean(g['sport'])}|matchup={clean(matchup(g))}"
+                   f"|time={time_s}|where={clean(g['location'])}|ha={g['ha']}}}}}")
+    out.append("{{Live Week/End}}")
+    return "\n".join(out) + "\n<!-- updated %s -->\n" % stamp()
+
+
 def pick(games: list[dict], now: datetime):
     """Split into live / recent finals / upcoming, and choose the card game."""
     live = [g for g in games if g["status"] == "live"]
@@ -492,6 +522,7 @@ def cmd_update(args):
             changed = pub.put(CARD_PAGE, card_text(card, football), summary_for(card))
             changed |= pub.put(TICKER_PAGE, ticker_text(live, finals, upcoming),
                                f"Ticker: {len(live)} live, {len(finals)} results, {len(upcoming)} upcoming")
+            changed |= pub.put(WEEK_PAGE, week_text(games, now), "This week's games")
             if changed and pub.wiki:
                 pub.wiki.purge("Main Page")
             if not needs_polling(games, now):
@@ -512,6 +543,7 @@ def cmd_render(args):
     card, l, f, u = pick(games, now)
     print(card_text(card, fx.get("cfbd")))
     print(ticker_text(l, f, u))
+    print(week_text(games, now))
     print("needs_polling:", needs_polling(games, now))
 
 
