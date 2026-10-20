@@ -119,13 +119,15 @@ class Wiki:
     def _get(self, **p):
         p.update(format="json", formatversion="2")
         r = self.s.get(self.api, params=p, timeout=30)
-        r.raise_for_status()
+        if r.status_code >= 400:
+            raise RuntimeError(f"Wiki HTTP {r.status_code}: {r.text[:600]!r}")
         return r.json()
 
     def _post(self, **p):
         p.update(format="json", formatversion="2")
         r = self.s.post(self.api, data=p, timeout=30)
-        r.raise_for_status()
+        if r.status_code >= 400:
+            raise RuntimeError(f"Wiki HTTP {r.status_code}: {r.text[:600]!r}")
         return r.json()
 
     def login(self):
