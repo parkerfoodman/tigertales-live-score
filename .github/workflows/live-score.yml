@@ -28,4 +28,5 @@ jobs:
           WIKI_API_URL: ${{ secrets.WIKI_API_URL }}
           WIKI_BOT_USER: ${{ secrets.WIKI_BOT_USER }}
           WIKI_BOT_PASSWORD: ${{ secrets.WIKI_BOT_PASSWORD }}
+          WIKI_BOT_UA: ${{ secrets.WIKI_BOT_UA }}
           POLL_SECONDS: "120"
