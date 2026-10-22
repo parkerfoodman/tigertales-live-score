@@ -19,6 +19,7 @@ Subcommands
 
 Environment
   WIKI_API_URL, WIKI_BOT_USER, WIKI_BOT_PASSWORD   wiki login (BotPassword)
+  WIKI_BOT_UA        private user agent for wiki requests (keep it secret; never commit it)
   CFBD_API_KEY       optional, adds football situation/possession
   POLL_SECONDS       default 120
   DRY_RUN=1          print instead of editing the wiki
@@ -70,7 +71,11 @@ SHORT = {"Men's Basketball": "MBB", "Women's Basketball": "WBB", "Men's Soccer":
 INDIVIDUAL = {"Men's Golf", "Women's Golf", "Men's Tennis", "Women's Tennis", "Cross Country",
               "Track & Field", "Rowing"}
 
+# Plain public user agent for third-party feeds (clemsontigers.com, CFBD only).
 USER_AGENT = "TigerTalesLiveScoreBot/1.0 (https://tigertalesclemson.com; User:Parkerfoodman)"
+# Private user agent for requests to the wiki. It comes from the environment so it
+# never lands in the repo. Do not post it in Discord, tickets or commits.
+WIKI_USER_AGENT = os.environ.get("WIKI_BOT_UA", "").strip()
 
 
 def log(msg: str) -> None:
@@ -399,7 +404,7 @@ class Wiki:
     def __init__(self, api_url: str, user: str, password: str):
         self.api = api_url
         self.s = requests.Session()
-        self.s.headers["User-Agent"] = USER_AGENT
+        self.s.headers["User-Agent"] = WIKI_USER_AGENT
         self.user, self.password = user, password
         self.logged_in = False
 
@@ -445,6 +450,8 @@ def make_wiki() -> Wiki | None:
     url, user, pw = (os.environ.get(k) for k in ("WIKI_API_URL", "WIKI_BOT_USER", "WIKI_BOT_PASSWORD"))
     if not all((url, user, pw)):
         sys.exit("WIKI_API_URL, WIKI_BOT_USER and WIKI_BOT_PASSWORD must be set (or DRY_RUN=1)")
+    if not WIKI_USER_AGENT:
+        sys.exit("WIKI_BOT_UA must be set to the private wiki user agent (or DRY_RUN=1)")
     return Wiki(url, user, pw)
 
 
@@ -557,4 +564,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    main()
