@@ -410,11 +410,26 @@ class Wiki:
 
     def _req(self, method, **p):
         p.update(format="json", formatversion="2")
-        r = (self.s.get(self.api, params=p, timeout=30) if method == "GET"
-             else self.s.post(self.api, data=p, timeout=30))
+        # Never follow redirects: a redirected POST silently becomes an empty GET
+        # and the API answers with its HTML help page instead of JSON.
+        r = (self.s.get(self.api, params=p, timeout=30, allow_redirects=False)
+             if method == "GET"
+             else self.s.post(self.api, data=p, timeout=30, allow_redirects=False))
+        if 300 <= r.status_code < 400:
+            raise RuntimeError(
+                f"Wiki redirected ({r.status_code}) to {r.headers.get('Location')!r}. "
+                f"Set WIKI_API_URL to that address (currently {self.api!r}).")
         if r.status_code >= 400:
-            raise RuntimeError(f"Wiki HTTP {r.status_code}: {r.text[:600]!r}")
-        return r.json()
+            hint = (" Looks like the Cloudflare anti-bot challenge; check the User-Agent "
+                    "exception." if "cloudflare" in r.text.lower() else "")
+            raise RuntimeError(f"Wiki HTTP {r.status_code}: {r.text[:600]!r}{hint}")
+        try:
+            return r.json()
+        except ValueError:
+            raise RuntimeError(
+                f"Wiki returned HTTP {r.status_code} with non-JSON content "
+                f"({r.headers.get('Content-Type')!r}) from {self.api!r}. "
+                f"Check WIKI_API_URL. Body starts: {r.text[:300]!r}") from None
 
     def login(self):
         if self.logged_in:
