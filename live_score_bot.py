@@ -55,7 +55,9 @@ FINAL_ON_CARD = timedelta(hours=4)      # keep a final on the card this long
 FINALS_ON_TICKER = timedelta(days=5)    # recent results shown in the ticker
 UPCOMING_ON_TICKER = timedelta(days=7)
 LOOKAHEAD = timedelta(minutes=70)       # stay running if a game starts this soon
-JOB_BUDGET = timedelta(hours=5, minutes=45)
+# Each run stops before the next hourly start (:07) so runs never queue up behind each other;
+# the next hourly run picks up polling where this one left off.
+JOB_BUDGET = timedelta(minutes=int(os.environ.get("JOB_MINUTES", "52")))
 
 # When several games are live at once, the card shows the highest priority.
 PRIORITY = ["Football", "Men's Basketball", "Women's Basketball", "Baseball",

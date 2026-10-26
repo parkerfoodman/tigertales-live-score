@@ -2,7 +2,8 @@ name: Live score
 
 # Hourly. Refreshes the Main Page card and the score ticker for every Clemson
 # varsity sport. If a game is live or about to start, the job keeps running and
-# polls every 2 minutes until nothing is live.
+# polls every 2 minutes until nothing is live. Each run stops after ~52 min so it
+# never overlaps the next hourly run; that run carries on the polling.
 on:
   schedule:
     - cron: "7 * * * *"
@@ -15,7 +16,7 @@ concurrency:
 jobs:
   update:
     runs-on: ubuntu-latest
-    timeout-minutes: 355
+    timeout-minutes: 58
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -30,3 +31,4 @@ jobs:
           WIKI_BOT_PASSWORD: ${{ secrets.WIKI_BOT_PASSWORD }}
           WIKI_BOT_UA: ${{ secrets.WIKI_BOT_UA }}
           POLL_SECONDS: "120"
+          JOB_MINUTES: "52"
