@@ -167,7 +167,8 @@ class EspnLive:
         if key not in self.cache:
             try:
                 r = self.s.get(ESPN.format(path=path),
-                               params={"dates": key[1], "limit": "500", "groups": "50"}, timeout=20)
+                               params={"dates": key[1], "limit": "500",
+                                       "groups": "80" if sport == "Football" else "50"}, timeout=20)
                 r.raise_for_status()
                 self.cache[key] = r.json().get("events", []) or []
             except Exception as e:
