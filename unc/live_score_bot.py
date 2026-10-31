@@ -293,7 +293,18 @@ def normalize(e: dict, live: dict, espn: "EspnLive | None" = None, now: datetime
         if lg:
             g["us"] = num(lg.get("teamScore") or lg.get("homeScore") or g["us"])
             g["them"] = num(lg.get("opponentScore") or lg.get("awayScore") or g["them"])
-            g["period"] = str(lg.get("periodLabel") or lg.get("period") or "")
+            # goheels game center: teams.home/away.Score plus schoolIsHome.
+            tm = lg.get("teams") or {}
+            if isinstance(tm, dict) and tm.get("home") and tm.get("away"):
+                mine, theirs = ("home", "away") if tm.get("schoolIsHome", True) else ("away", "home")
+                if (tm[mine] or {}).get("Score") is not None:
+                    g["us"] = num(tm[mine].get("Score"))
+                if (tm[theirs] or {}).get("Score") is not None:
+                    g["them"] = num(tm[theirs].get("Score"))
+            p = lg.get("periodLabel") or lg.get("period") or ""
+            if g["sport"] == "Football" and str(p).isdigit():
+                p = {1: "1st", 2: "2nd", 3: "3rd", 4: "4th"}.get(int(p), "OT")
+            g["period"] = str(p)
             g["clock"] = str(lg.get("clock") or lg.get("gameClock") or "")
     elif letter in ("W", "L", "T") and res.get("teamScore") not in (None, ""):
         g.update(status="final", us=num(res.get("teamScore")), them=num(res.get("opponentScore")),
