@@ -1,0 +1,37 @@
+name: UNC live score (TarHeel Tales)
+
+# Same bot as Tiger Tales, pointed at goheels.com and TarHeel Tales.
+# Hourly at :37 (Tiger Tales runs at :07). If a game is live or about to start,
+# the job keeps polling every 2 minutes, stopping after ~52 min so runs never overlap.
+# Reuses this repo's secrets; only the wiki address differs.
+on:
+  schedule:
+    - cron: "37 * * * *"
+  workflow_dispatch: {}
+
+concurrency:
+  group: unc-live-score
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 58
+    defaults:
+      run:
+        working-directory: unc
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt
+      - run: python live_score_bot.py update
+        env:
+          CFBD_API_KEY: ${{ secrets.CFBD_API_KEY }}
+          WIKI_API_URL: https://tarheeltalesunc.miraheze.org/w/api.php
+          WIKI_BOT_USER: ${{ secrets.WIKI_BOT_USER }}
+          WIKI_BOT_PASSWORD: ${{ secrets.WIKI_BOT_PASSWORD }}
+          WIKI_BOT_UA: ${{ secrets.WIKI_BOT_UA }}
+          POLL_SECONDS: "120"
+          JOB_MINUTES: "52"
