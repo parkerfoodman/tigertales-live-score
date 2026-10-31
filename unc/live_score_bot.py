@@ -300,14 +300,21 @@ def normalize(e: dict, live: dict, espn: "EspnLive | None" = None, now: datetime
     elif letter or res.get("preScore") or res.get("postScore") or state == "GAMECOMPLETE":
         txt = tidy_text(" ".join(x for x in (res.get("preScore"), res.get("postScore")) if x))
         g.update(status="final" if txt else "done", text=txt)
+    now = now or now_utc()
+    # goheels lists games in its game center during pre-game coverage. Until
+    # kickoff (or goheels' own live state), that's still an upcoming game.
+    if g["status"] == "live" and state not in LIVE_STATES and g["start"] and now < g["start"]:
+        g.update(status="upcoming", us="", them="", period="", clock="")
     # ESPN supplies the live score/period for team sports, and catches games
     # goheels hasn't flipped to live yet.
-    now = now or now_utc()
     if espn and g["sport"] in ESPN_PATHS and g["status"] in ("upcoming", "live") \
             and g["start"] - timedelta(minutes=20) <= now <= g["start"] + timedelta(hours=6):
         x = espn.find(g)
-        if x and x["state"] == "in":
-            g.update(status="live", us=x["us"] or g["us"], them=x["them"] or g["them"],
+        if x and x["state"] == "pre" and state not in LIVE_STATES:
+            g.update(status="upcoming", us="", them="", period="", clock="")
+        elif x and x["state"] == "in":
+            g.update(status="live", us=x["us"] if x["us"] not in (None, "") else g["us"],
+                     them=x["them"] if x["them"] not in (None, "") else g["them"],
                      period=x["period"] or g["period"], clock="")
         elif x and x["state"] == "post":
             g.update(status="final", us=x["us"], them=x["them"], result=_result_letter(x["us"], x["them"]))
