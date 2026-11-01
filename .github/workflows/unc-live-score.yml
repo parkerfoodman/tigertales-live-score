@@ -29,7 +29,7 @@ jobs:
       - run: python live_score_bot.py update
         env:
           CFBD_API_KEY: ${{ secrets.CFBD_API_KEY }}
-          WIKI_API_URL: https://tarheeltalesunc.miraheze.org/w/api.php
+          WIKI_API_URL: https://tarheeltalesunc.com/w/api.php
           WIKI_BOT_USER: ${{ secrets.WIKI_BOT_USER }}
           WIKI_BOT_PASSWORD: ${{ secrets.WIKI_BOT_PASSWORD }}
           WIKI_BOT_UA: ${{ secrets.WIKI_BOT_UA }}
